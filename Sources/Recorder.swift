@@ -133,8 +133,10 @@ final class Recorder: ObservableObject {
         }
         defer { try? handle.close() }
 
+        var currentIndex = indexURL
         var lastSeq = -1
         var consecutiveFail = 0
+        var segFailStreak = 0
         var wroteInit = false
         var lastInitURI = ""
 
@@ -144,7 +146,7 @@ final class Recorder: ObservableObject {
                 break
             }
 
-            let (text, code) = await fetchText(indexURL)
+            let (text, code, finalURL) = await fetchText(currentIndex)
             guard let text else {
                 consecutiveFail += 1
                 lastError = "拉取播放列表失败（HTTP \(code)），第 \(consecutiveFail) 次重试"
@@ -160,7 +162,17 @@ final class Recorder: ObservableObject {
             consecutiveFail = 0
             lastError = ""
 
-            let playlist = M3U8.parse(text, base: indexURL)
+            let playlist = M3U8.parse(text, base: finalURL)
+            if finalURL != indexURL || currentIndex != indexURL {
+                streamURL = finalURL.absoluteString
+            }
+
+            // 主列表（多码率）：挑第一个子流继续
+            if playlist.segments.isEmpty, let v = playlist.variants.first, let vu = URL(string: v) {
+                currentIndex = vu
+                lastError = ""
+                continue
+            }
             if playlist.encrypted {
                 phase = .failed
                 lastError = "该流带 AES-128 加密，暂不支持"
@@ -169,7 +181,7 @@ final class Recorder: ObservableObject {
 
             // fMP4 初始化段（EXT-X-MAP），只写一次
             if let mapURI = playlist.initSegmentURI, mapURI != lastInitURI {
-                if let u = M3U8.absoluteURL(mapURI, base: indexURL),
+                if let u = M3U8.absoluteURL(mapURI, base: finalURL),
                    let data = await fetchData(u), !data.isEmpty {
                     try? handle.write(contentsOf: data)
                     bytes += Int64(data.count)
@@ -197,9 +209,15 @@ final class Recorder: ObservableObject {
                     bytes += Int64(data.count)
                     segmentsDone += 1
                     duration += seg.duration
+                    segFailStreak = 0
                     message = "录制中"
                 } else {
-                    lastError = "切片 \(seq) 下载失败，稍后重试"
+                    segFailStreak += 1
+                    if segFailStreak >= 5 {
+                        lastError = "连续 \(segFailStreak) 个切片下载失败，请检查链接是否过期"
+                    } else {
+                        lastError = "切片 \(seq) 下载失败，重试中"
+                    }
                     break
                 }
                 lastSeq = seq
@@ -218,7 +236,7 @@ final class Recorder: ObservableObject {
 
     // MARK: - 网络
 
-    private func fetchText(_ url: URL) async -> (String?, Int) {
+    private func fetchText(_ url: URL) async -> (String?, Int, URL) {
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
         req.setValue("*/*", forHTTPHeaderField: "Accept")
@@ -226,10 +244,13 @@ final class Recorder: ObservableObject {
         do {
             let (data, resp) = try await session.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-            guard (200..<300).contains(code) else { return (nil, code) }
-            return (String(data: data, encoding: .utf8), code)
+            // 关键：跟随 302 之后，基准地址必须用最终 URL，
+            // 否则相对切片会被拼到旧域名上导致全部 404
+            let final = resp.url ?? url
+            guard (200..<300).contains(code) else { return (nil, code, final) }
+            return (String(data: data, encoding: .utf8), code, final)
         } catch {
-            return (nil, (error as NSError).code)
+            return (nil, (error as NSError).code, url)
         }
     }
 

@@ -13,6 +13,8 @@ struct Playlist {
     var encrypted: Bool = false
     /// fMP4 流的初始化段（#EXT-X-MAP:URI="..."）
     var initSegmentURI: String? = nil
+    /// 多码率主列表里的子播放列表
+    var variants: [String] = []
 }
 
 enum M3U8 {
@@ -20,6 +22,7 @@ enum M3U8 {
     static func parse(_ text: String, base: URL) -> Playlist {
         var p = Playlist()
         var pendingDuration: Double = 0
+        var pendingIsVariant = false
 
         for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -45,10 +48,17 @@ enum M3U8 {
                         p.initSegmentURI = String(rest[..<endq])
                     }
                 }
+            } else if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                pendingIsVariant = true
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
                 p.ended = true
             } else if !line.hasPrefix("#") {
-                if let u = absoluteURL(line, base: base) {
+                if pendingIsVariant {
+                    if let u = absoluteURL(line, base: base) {
+                        p.variants.append(u.absoluteString)
+                    }
+                    pendingIsVariant = false
+                } else if let u = absoluteURL(line, base: base) {
                     p.segments.append(Segment(url: u, duration: pendingDuration))
                 }
                 pendingDuration = 0
