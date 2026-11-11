@@ -324,46 +324,25 @@ final class Recorder: ObservableObject {
         return (total, total > 0 && Double(good) / Double(total) > 0.9, size)
     }
 
-    /// TS → MP4。先试无损 passthrough，失败自动降级重新编码。
+    /// TS → MP4。
+    /// 注意：不能用 AVAssetExportSession —— AVFoundation 不支持裸 MPEG-TS 解复用，
+    /// passthrough 和重编码都会失败。这里走自研封装（TS2MP4），无损且快。
     static func remuxToMP4(_ ts: URL, progress: ((Double) -> Void)? = nil) async -> URL? {
         let out = ts.deletingPathExtension().appendingPathExtension("mp4")
-
-        // 1) 无损换封装
-        if let r = await export(ts, to: out, preset: AVAssetExportPresetPassthrough, progress: progress) {
-            return r
-        }
-        // 2) 降级：重新编码（慢，但几乎一定能过）
         try? FileManager.default.removeItem(at: out)
-        if let r = await export(ts, to: out, preset: AVAssetExportPreset1280x720, progress: progress) {
-            return r
-        }
-        try? FileManager.default.removeItem(at: out)
-        return await export(ts, to: out, preset: AVAssetExportPresetMediumQuality, progress: progress)
-    }
-
-    private static func export(_ src: URL, to out: URL,
-                               preset: String,
-                               progress: ((Double) -> Void)?) async -> URL? {
-        let asset = AVURLAsset(url: src)
-        guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else { return nil }
-        guard exporter.supportedFileTypes.contains(.mp4) else { return nil }
-        try? FileManager.default.removeItem(at: out)
-        exporter.outputURL = out
-        exporter.outputFileType = .mp4
-        exporter.shouldOptimizeForNetworkUse = false
-
-        let poller = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                progress?(Double(exporter.progress))
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try TS2MP4.convert(ts, to: out) { p in progress?(p) }
+                    progress?(1.0)
+                    cont.resume(returning: fileSize(out) > 10_000 ? out : nil)
+                } catch {
+                    lastErrorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    cont.resume(returning: nil)
+                }
             }
         }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            exporter.exportAsynchronously { cont.resume() }
-        }
-        poller.cancel()
-
-        guard exporter.status == .completed, fileSize(out) > 10_000 else { return nil }
-        return out
     }
+
+    nonisolated(unsafe) static var lastErrorText = ""
 }

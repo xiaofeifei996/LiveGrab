@@ -194,6 +194,7 @@ struct ContentView: View {
                 return
             }
 
+            Recorder.lastErrorText = ""
             let mp4 = await Recorder.remuxToMP4(ts) { p in
                 Task { @MainActor in
                     self.convertProgress = p
@@ -205,7 +206,8 @@ struct ContentView: View {
             if let mp4 {
                 alert = "已生成 \(mp4.lastPathComponent)"
             } else {
-                alert = "转换失败。\n建议直接点「分享 / 导出到文件 App」，用外部工具转。"
+                let why = Recorder.lastErrorText
+                alert = "转换失败\(why.isEmpty ? "" : "：\(why)")。\n可以点「分享 / 导出到文件 App」保存原始 .ts。"
             }
         }
     }
