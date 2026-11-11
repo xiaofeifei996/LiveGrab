@@ -11,6 +11,8 @@ struct Playlist {
     var targetDuration: Double = 4
     var ended: Bool = false
     var encrypted: Bool = false
+    /// fMP4 流的初始化段（#EXT-X-MAP:URI="..."）
+    var initSegmentURI: String? = nil
 }
 
 enum M3U8 {
@@ -36,6 +38,13 @@ enum M3U8 {
                 let v = line.dropFirst("#EXTINF:".count)
                 let head = v.split(separator: ",").first.map(String.init) ?? ""
                 pendingDuration = Double(head.trimmingCharacters(in: .whitespaces)) ?? 0
+            } else if line.hasPrefix("#EXT-X-MAP:") {
+                if let r = line.range(of: "URI=\"") {
+                    let rest = line[r.upperBound...]
+                    if let endq = rest.firstIndex(of: "\"") {
+                        p.initSegmentURI = String(rest[..<endq])
+                    }
+                }
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
                 p.ended = true
             } else if !line.hasPrefix("#") {

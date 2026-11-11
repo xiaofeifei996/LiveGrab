@@ -15,32 +15,82 @@ final class Recorder: ObservableObject {
     @Published private(set) var message = ""
     @Published private(set) var outputURL: URL?
 
+    /// 最近的下载速率（KB/s），用于画小趋势图
+    @Published private(set) var speedHistory: [Double] = []
+    @Published private(set) var speed: Double = 0
+    /// 多少秒没收到数据了（卡住预警）
+    @Published private(set) var stalledSeconds = 0
+    /// 最近一次错误（红字显示）
+    @Published private(set) var lastError = ""
+    /// 解析出来的流地址，方便核对
+    @Published private(set) var streamURL = ""
+
     /// 0 表示不限时长
     var limitMinutes: Int = 0
+    /// 播放页地址，很多 CDN 校验 Referer
+    var referer: String = ""
+
+    var progress: Double? {
+        guard limitMinutes > 0 else { return nil }
+        return min(1.0, duration / Double(limitMinutes * 60))
+    }
 
     private var task: Task<Void, Never>?
+    private var watcher: Task<Void, Never>?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
+
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        cfg.timeoutIntervalForResource = 60
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 45
         cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        cfg.httpMaximumConnectionsPerHost = 4
+        cfg.waitsForConnectivity = false
+        cfg.httpMaximumConnectionsPerHost = 2
         return URLSession(configuration: cfg)
     }()
 
     var isBusy: Bool { phase == .resolving || phase == .running || phase == .finishing }
 
-    // MARK: - 对外接口
+    // MARK: - 控制
+
+    func markResolving(_ url: String = "") {
+        phase = .resolving
+        message = "解析流地址…"
+        streamURL = url
+        lastError = ""
+    }
 
     func start(playlistURL: URL) {
         guard task == nil else { return }
+        streamURL = playlistURL.absoluteString
         let limitSeconds = limitMinutes > 0 ? Double(limitMinutes * 60) : 0
+
+        watcher = Task { [weak self] in
+            var lastBytes: Int64 = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                let now = self.bytes
+                let kbps = Double(now - lastBytes) / 1024.0
+                lastBytes = now
+                self.speed = kbps
+                self.speedHistory.append(kbps)
+                if self.speedHistory.count > 60 { self.speedHistory.removeFirst() }
+                if kbps <= 0.01 && self.phase == .running {
+                    self.stalledSeconds += 1
+                } else {
+                    self.stalledSeconds = 0
+                }
+            }
+        }
+
         task = Task { [weak self] in
             guard let self else { return }
             await self.runLoop(indexURL: playlistURL, limitSeconds: limitSeconds)
             await MainActor.run {
                 self.task = nil
+                self.watcher?.cancel()
+                self.watcher = nil
                 self.endBackground()
             }
         }
@@ -48,42 +98,45 @@ final class Recorder: ObservableObject {
 
     func stop() {
         task?.cancel()
-    }
-
-    func markResolving() {
-        phase = .resolving
-        message = "解析中…"
+        if phase == .resolving { phase = .done; message = "已取消" }
     }
 
     func reset() {
-        task?.cancel()
-        task = nil
+        task?.cancel(); watcher?.cancel()
+        task = nil; watcher = nil
         phase = .idle
         segmentsDone = 0
         bytes = 0
         duration = 0
         message = ""
         outputURL = nil
+        speed = 0
+        speedHistory = []
+        stalledSeconds = 0
+        lastError = ""
+        streamURL = ""
     }
 
     // MARK: - 主循环
 
     private func runLoop(indexURL: URL, limitSeconds: Double) async {
         phase = .running
-        message = "正在拉取直播切片…"
+        message = "正在拉取播放列表…"
         beginBackground()
 
         let outURL = Self.documentsDir.appendingPathComponent(Self.fileName())
         FileManager.default.createFile(atPath: outURL.path, contents: nil)
         guard let handle = try? FileHandle(forWritingTo: outURL) else {
             phase = .failed
-            message = "无法创建文件"
+            lastError = "无法创建文件"
             return
         }
         defer { try? handle.close() }
 
-        var lastSeq = -1          // 已写盘的最后一个序号
+        var lastSeq = -1
         var consecutiveFail = 0
+        var wroteInit = false
+        var lastInitURI = ""
 
         while !Task.isCancelled {
             if limitSeconds > 0 && duration >= limitSeconds {
@@ -91,25 +144,40 @@ final class Recorder: ObservableObject {
                 break
             }
 
-            guard let text = await fetchText(indexURL) else {
+            let (text, code) = await fetchText(indexURL)
+            guard let text else {
                 consecutiveFail += 1
+                lastError = "拉取播放列表失败（HTTP \(code)），第 \(consecutiveFail) 次重试"
+                message = "重试中…（\(consecutiveFail)/30）"
                 if consecutiveFail > 30 {
                     phase = .failed
-                    message = "连续 30 次拉不到播放列表，可能链接已过期"
-                    return
+                    lastError = "连续 30 次拉不到播放列表，链接可能已过期"
+                    break
                 }
-                message = "列表拉取失败，重试中…（\(consecutiveFail)/30）"
                 try? await sleep(2)
                 continue
             }
             consecutiveFail = 0
+            lastError = ""
 
             let playlist = M3U8.parse(text, base: indexURL)
             if playlist.encrypted {
                 phase = .failed
-                message = "该流带 AES-128 加密，暂不支持"
-                return
+                lastError = "该流带 AES-128 加密，暂不支持"
+                break
             }
+
+            // fMP4 初始化段（EXT-X-MAP），只写一次
+            if let mapURI = playlist.initSegmentURI, mapURI != lastInitURI {
+                if let u = M3U8.absoluteURL(mapURI, base: indexURL),
+                   let data = await fetchData(u), !data.isEmpty {
+                    try? handle.write(contentsOf: data)
+                    bytes += Int64(data.count)
+                    wroteInit = true
+                    lastInitURI = mapURI
+                }
+            }
+            _ = wroteInit
 
             for (i, seg) in playlist.segments.enumerated() {
                 if Task.isCancelled { break }
@@ -120,17 +188,18 @@ final class Recorder: ObservableObject {
                 if let data = await fetchData(seg.url), !data.isEmpty {
                     do {
                         try handle.write(contentsOf: data)
+                        try? handle.synchronize()
                     } catch {
                         phase = .failed
-                        message = "写文件失败：\(error.localizedDescription)"
+                        lastError = "写文件失败：\(error.localizedDescription)"
                         return
                     }
                     bytes += Int64(data.count)
                     segmentsDone += 1
                     duration += seg.duration
-                    message = "录制中… 已保存 \(Fmt.clock(duration))"
+                    message = "录制中"
                 } else {
-                    // 单个切片失败：下一轮会重试（序号未推进）
+                    lastError = "切片 \(seq) 下载失败，稍后重试"
                     break
                 }
                 lastSeq = seq
@@ -138,30 +207,44 @@ final class Recorder: ObservableObject {
 
             if playlist.ended { message = "直播已结束"; break }
 
-            try? await sleep(max(1.0, playlist.targetDuration / 2))
+            try? await sleep(max(1.0, min(3.0, playlist.targetDuration / 2)))
         }
 
         if Task.isCancelled { message = "已手动停止" }
+        else if message.isEmpty { message = "结束" }
         outputURL = outURL
         phase = .done
     }
 
     // MARK: - 网络
 
-    private func fetchText(_ url: URL) async -> String? {
+    private func fetchText(_ url: URL) async -> (String?, Int) {
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        guard let (data, resp) = try? await session.data(for: req) else { return nil }
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-        return String(data: data, encoding: .utf8)
+        req.setValue("*/*", forHTTPHeaderField: "Accept")
+        if !referer.isEmpty { req.setValue(referer, forHTTPHeaderField: "Referer") }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard (200..<300).contains(code) else { return (nil, code) }
+            return (String(data: data, encoding: .utf8), code)
+        } catch {
+            return (nil, (error as NSError).code)
+        }
     }
 
     private func fetchData(_ url: URL) async -> Data? {
         var req = URLRequest(url: url)
         req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
-        guard let (data, resp) = try? await session.data(for: req) else { return nil }
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-        return data
+        if !referer.isEmpty { req.setValue(referer, forHTTPHeaderField: "Referer") }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard (200..<300).contains(code), !data.isEmpty else { return nil }
+            return data
+        } catch {
+            return nil
+        }
     }
 
     private func sleep(_ seconds: Double) async throws {
@@ -193,7 +276,6 @@ final class Recorder: ObservableObject {
         return "live_\(f.string(from: Date())).ts"
     }
 
-    /// .ts → .mp4（不转码，只换封装），失败返回 nil
     static func remuxToMP4(_ ts: URL) async -> URL? {
         let asset = AVURLAsset(url: ts)
         guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
@@ -207,7 +289,6 @@ final class Recorder: ObservableObject {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             exporter.exportAsynchronously { cont.resume() }
         }
-        if exporter.status == .completed { return out }
-        return nil
+        return exporter.status == .completed ? out : nil
     }
 }

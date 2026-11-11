@@ -47,7 +47,9 @@ struct ContentView: View {
                 } header: {
                     Text("直播源")
                 } footer: {
-                    Text(useDirect ? "直接把 m3u8 播放列表地址填进来。" : "打开页面后自动解析出真正的流地址。")
+                    Text(useDirect
+                         ? "直接把 m3u8 播放列表地址填进来。"
+                         : "打开页面后自动解析出真正的流地址。带 url= 参数的播放页会直接取参数。")
                 }
 
                 Section("录制时长") {
@@ -77,17 +79,9 @@ struct ContentView: View {
                     }
                 }
 
-                if recorder.phase != .idle || !resolver.log.isEmpty {
+                if recorder.isBusy || recorder.phase != .idle {
                     Section("状态") {
-                        row("进度", statusText)
-                        if recorder.segmentsDone > 0 {
-                            row("切片", "\(recorder.segmentsDone) 个")
-                            row("已用时", Fmt.clock(recorder.duration))
-                            row("文件大小", Fmt.bytes(recorder.bytes))
-                        }
-                        if !resolver.log.isEmpty && recorder.phase == .resolving {
-                            Text(resolver.log).font(.caption).foregroundStyle(.secondary)
-                        }
+                        StatusPanel(recorder: recorder)
                     }
                 }
 
@@ -124,25 +118,6 @@ struct ContentView: View {
         }
     }
 
-    private func row(_ k: String, _ v: String) -> some View {
-        HStack {
-            Text(k)
-            Spacer()
-            Text(v).foregroundStyle(.secondary)
-        }
-    }
-
-    private var statusText: String {
-        switch recorder.phase {
-        case .idle: return "待机"
-        case .resolving: return "解析中"
-        case .running: return recorder.message
-        case .finishing: return "收尾中"
-        case .done: return recorder.message.isEmpty ? "完成" : recorder.message
-        case .failed: return "失败"
-        }
-    }
-
     private func begin() {
         recorder.reset()
         recorder.limitMinutes = limits[limitIndex]
@@ -153,15 +128,36 @@ struct ContentView: View {
             return
         }
 
+        // 播放页直接把真地址放在 url= 参数里，先试这个，省掉整个 WebView 流程
+        if let embedded = Self.extractURIParam(pageURL), embedded.contains(".m3u8"),
+           let u = URL(string: embedded) {
+            recorder.markResolving(embedded)
+            recorder.referer = pageURL
+            recorder.start(playlistURL: u)
+            return
+        }
+
         guard URL(string: pageURL) != nil else { alert = "页面地址格式不对"; return }
         recorder.markResolving()
         resolver.resolve(pageURL: pageURL) { result in
             guard let urlString = result, let u = URL(string: urlString) else {
                 alert = "没能从页面里解析出 m3u8。\n可以切成「直链 m3u8」手动填入。"
+                recorder.stop()
+                recorder.reset()
                 return
             }
+            recorder.referer = pageURL
             recorder.start(playlistURL: u)
         }
+    }
+
+    /// 从 `?url=<encoded>` 里取出真正的流地址
+    static func extractURIParam(_ s: String) -> String? {
+        guard let r = s.range(of: "url=") else { return nil }
+        var tail = String(s[r.upperBound...])
+        if let amp = tail.firstIndex(of: "&") { tail = String(tail[..<amp]) }
+        let decoded = tail.removingPercentEncoding ?? tail
+        return decoded.hasPrefix("http") ? decoded : nil
     }
 
     private func play(_ url: URL) {
@@ -175,11 +171,7 @@ struct ContentView: View {
         Task {
             alert = "正在转换，请稍候…"
             let mp4 = await Recorder.remuxToMP4(ts)
-            if let mp4 {
-                alert = "已生成 \(mp4.lastPathComponent)"
-            } else {
-                alert = "转换失败（可能是 TS 封装头部不完整）"
-            }
+            alert = mp4 != nil ? "已生成 \(mp4!.lastPathComponent)" : "转换失败（TS 头部不完整）"
         }
     }
 
@@ -204,6 +196,122 @@ struct ContentView: View {
         var vc = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
         while let p = vc?.presentedViewController { vc = p }
         return vc
+    }
+}
+
+// MARK: - 状态面板（核心：进度条 + 速度 + 诊断）
+
+struct StatusPanel: View {
+    @ObservedObject var recorder: Recorder
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+
+            // 进度条
+            VStack(alignment: .leading, spacing: 6) {
+                if let p = recorder.progress {
+                    ProgressView(value: p)
+                        .progressViewStyle(.linear)
+                        .tint(p >= 1 ? .green : .accentColor)
+                    HStack {
+                        Text(Fmt.clock(recorder.duration)).font(.caption.monospacedDigit())
+                        Spacer()
+                        Text("\(Int(p * 100))% / 共 \(recorder.limitMinutes) 分钟")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    // 不限时长：不确定进度条，动起来就能看出还活着
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                    Text("不限时长 · 已录 \(Fmt.clock(recorder.duration))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // 速率 + 卡住预警
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(recorder.stalledSeconds > 5 ? Color.orange : Color.green)
+                    .frame(width: 8, height: 8)
+                Text(recorder.stalledSeconds > 5
+                     ? "无数据 \(recorder.stalledSeconds)s，正在重试"
+                     : String(format: "%.0f KB/s", recorder.speed))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(recorder.stalledSeconds > 5 ? .orange : .secondary)
+                Spacer()
+                Text(Fmt.bytes(recorder.bytes))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            // 速度趋势
+            if recorder.speedHistory.count > 2 {
+                Sparkline(values: recorder.speedHistory)
+                    .frame(height: 28)
+            }
+
+            // 明细
+            VStack(spacing: 6) {
+                row("状态", recorder.message.isEmpty ? statusWord : recorder.message)
+                row("切片", "\(recorder.segmentsDone) 个")
+                if !recorder.streamURL.isEmpty {
+                    Text(recorder.streamURL)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+            }
+
+            if !recorder.lastError.isEmpty {
+                Label(recorder.lastError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var statusWord: String {
+        switch recorder.phase {
+        case .idle: return "待机"
+        case .resolving: return "解析中"
+        case .running: return "录制中"
+        case .finishing: return "收尾中"
+        case .done: return "完成"
+        case .failed: return "失败"
+        }
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k).font(.subheadline)
+            Spacer()
+            Text(v).font(.subheadline).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// 极简速率曲线
+struct Sparkline: View {
+    let values: [Double]
+
+    var body: some View {
+        GeometryReader { geo in
+            let maxV = max(values.max() ?? 1, 1)
+            Path { p in
+                let step = geo.size.width / CGFloat(max(values.count - 1, 1))
+                for (i, v) in values.enumerated() {
+                    let x = CGFloat(i) * step
+                    let y = geo.size.height * (1 - CGFloat(v / maxV))
+                    if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
+                    else { p.addLine(to: CGPoint(x: x, y: y)) }
+                }
+            }
+            .stroke(Color.accentColor.opacity(0.7), lineWidth: 1.5)
+        }
     }
 }
 
