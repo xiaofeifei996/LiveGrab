@@ -297,19 +297,73 @@ final class Recorder: ObservableObject {
         return "live_\(f.string(from: Date())).ts"
     }
 
-    static func remuxToMP4(_ ts: URL) async -> URL? {
-        let asset = AVURLAsset(url: ts)
-        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
-            return nil
+    static func fileSize(_ url: URL) -> Int64 {
+        let v = try? url.resourceValues(forKeys: [.fileSizeKey])
+        return Int64(v?.fileSize ?? 0)
+    }
+
+    /// 体检：扫 TS 同步字节(0x47)，粗略判断文件是否完整
+    static func inspectTS(_ url: URL) -> (packets: Int, syncOK: Bool, size: Int64) {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return (0, false, 0) }
+        defer { try? fh.close() }
+        let size = fileSize(url)
+        let chunk = 188 * 2000
+        var total = 0
+        var good = 0
+        while total < 188 * 200 {
+            guard let d = try? fh.read(upToCount: chunk), !d.isEmpty else { break }
+            let bytes = [UInt8](d)
+            var i = 0
+            while i + 188 <= bytes.count {
+                if bytes[i] == 0x47 { good += 1 }
+                total += 1
+                i += 188
+            }
+            break
         }
+        return (total, total > 0 && Double(good) / Double(total) > 0.9, size)
+    }
+
+    /// TS → MP4。先试无损 passthrough，失败自动降级重新编码。
+    static func remuxToMP4(_ ts: URL, progress: ((Double) -> Void)? = nil) async -> URL? {
         let out = ts.deletingPathExtension().appendingPathExtension("mp4")
+
+        // 1) 无损换封装
+        if let r = await export(ts, to: out, preset: AVAssetExportPresetPassthrough, progress: progress) {
+            return r
+        }
+        // 2) 降级：重新编码（慢，但几乎一定能过）
+        try? FileManager.default.removeItem(at: out)
+        if let r = await export(ts, to: out, preset: AVAssetExportPreset1280x720, progress: progress) {
+            return r
+        }
+        try? FileManager.default.removeItem(at: out)
+        return await export(ts, to: out, preset: AVAssetExportPresetMediumQuality, progress: progress)
+    }
+
+    private static func export(_ src: URL, to out: URL,
+                               preset: String,
+                               progress: ((Double) -> Void)?) async -> URL? {
+        let asset = AVURLAsset(url: src)
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else { return nil }
+        guard exporter.supportedFileTypes.contains(.mp4) else { return nil }
         try? FileManager.default.removeItem(at: out)
         exporter.outputURL = out
         exporter.outputFileType = .mp4
         exporter.shouldOptimizeForNetworkUse = false
+
+        let poller = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                progress?(Double(exporter.progress))
+            }
+        }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             exporter.exportAsynchronously { cont.resume() }
         }
-        return exporter.status == .completed ? out : nil
+        poller.cancel()
+
+        guard exporter.status == .completed, fileSize(out) > 10_000 else { return nil }
+        return out
     }
 }

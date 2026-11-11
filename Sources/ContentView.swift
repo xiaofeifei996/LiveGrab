@@ -20,6 +20,10 @@ struct ContentView: View {
     @State private var useDirect = false
     @State private var limitIndex = 0
     @State private var alert: String?
+    @State private var converting = false
+    @State private var convertProgress: Double = 0
+    @State private var convertNote = ""
+    @State private var shareItems: [Any] = []
 
     private let limits = [0, 10, 30, 60, 90, 120, 180]
 
@@ -90,9 +94,17 @@ struct ContentView: View {
                         Text(URL(fileURLWithPath: out.path).lastPathComponent)
                             .font(.system(.footnote, design: .monospaced))
 
-                        Button("播放") { play(out) }
-                        Button("转成 MP4（不转码）") { remux(out) }
-                        Button("保存到相册") { saveToPhotos(out) }
+                        if converting {
+                            ProgressView(value: convertProgress) {
+                                Text(convertNote).font(.caption)
+                            }
+                            .progressViewStyle(.linear)
+                        } else {
+                            Button("播放") { play(out) }
+                            Button("转成 MP4") { remux(out) }
+                            Button("存入相册") { saveToPhotos(out) }
+                            Button("分享 / 导出到文件 App") { share(out) }
+                        }
 
                         NavigationLink("已录文件列表") { FileList() }
                     }
@@ -168,17 +180,57 @@ struct ContentView: View {
     }
 
     private func remux(_ ts: URL) {
+        guard !converting else { return }
+        converting = true
+        convertProgress = 0
+        convertNote = "开始转换…"
+
         Task {
-            alert = "正在转换，请稍候…"
-            let mp4 = await Recorder.remuxToMP4(ts)
-            alert = mp4 != nil ? "已生成 \(mp4!.lastPathComponent)" : "转换失败（TS 头部不完整）"
+            // 先体检，文件坏了直接说清楚，不要假装在转
+            let info = Recorder.inspectTS(ts)
+            if !info.syncOK {
+                converting = false
+                alert = "这个文件不是完整的 TS（同步字节校验不通过），\n可能录制过程中断流了。\n已录 \(Fmt.bytes(info.size))，可以试着直接分享导出。"
+                return
+            }
+
+            let mp4 = await Recorder.remuxToMP4(ts) { p in
+                Task { @MainActor in
+                    self.convertProgress = p
+                    self.convertNote = p <= 0.01 ? "无损换封装…" : "转换中 \(Int(p * 100))%"
+                }
+            }
+
+            converting = false
+            if let mp4 {
+                alert = "已生成 \(mp4.lastPathComponent)"
+            } else {
+                alert = "转换失败。\n建议直接点「分享 / 导出到文件 App」，用外部工具转。"
+            }
         }
+    }
+
+    private func share(_ url: URL) {
+        guard let vc = topVC() else { return }
+        let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let pop = av.popoverPresentationController {
+            pop.sourceView = vc.view
+            pop.sourceRect = CGRect(x: vc.view.bounds.midX, y: vc.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        vc.present(av, animated: true)
     }
 
     private func saveToPhotos(_ url: URL) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
                 Task { @MainActor in alert = "没有相册权限，请到设置里开启" }
+                return
+            }
+            if url.pathExtension.lowercased() == "ts" {
+                Task { @MainActor in
+                    alert = "相册不支持 .ts 格式，请先转成 MP4；\n或者用「分享 / 导出到文件 App」保存原文件。"
+                }
                 return
             }
             PHPhotoLibrary.shared().performChanges {
