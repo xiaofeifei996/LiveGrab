@@ -79,11 +79,11 @@ struct ContentView: View {
 
                 if recorder.phase != .idle || !resolver.log.isEmpty {
                     Section("状态") {
-                        LabeledContent("进度", value: statusText)
+                        row("进度", statusText)
                         if recorder.segmentsDone > 0 {
-                            LabeledContent("切片", value: "\(recorder.segmentsDone) 个")
-                            LabeledContent("已用时", value: Fmt.clock(recorder.duration))
-                            LabeledContent("文件大小", value: Fmt.bytes(recorder.bytes))
+                            row("切片", "\(recorder.segmentsDone) 个")
+                            row("已用时", Fmt.clock(recorder.duration))
+                            row("文件大小", Fmt.bytes(recorder.bytes))
                         }
                         if !resolver.log.isEmpty && recorder.phase == .resolving {
                             Text(resolver.log).font(.caption).foregroundStyle(.secondary)
@@ -121,6 +121,14 @@ struct ContentView: View {
         .navigationViewStyle(.stack)
         .onChange(of: limitIndex) { idx in
             recorder.limitMinutes = limits[idx]
+        }
+    }
+
+    private func row(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k)
+            Spacer()
+            Text(v).foregroundStyle(.secondary)
         }
     }
 
@@ -225,7 +233,7 @@ struct FileList: View {
         }
         .navigationTitle("已录文件")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
                 Button("刷新") { reload() }
             }
         }
