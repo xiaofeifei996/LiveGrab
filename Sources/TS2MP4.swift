@@ -477,7 +477,7 @@ enum TS2MP4 {
             func traf(_ tid: Int, _ base: Int64, _ samples: [(Int, Data, Int)], _ dataOffset: Int) -> Data {
                 let tfhd = fullbox("tfhd", 0, 0x020000, be32(tid))
                 let tfdt = fullbox("tfdt", 1, 0, be64(UInt64(max(0, base))))
-                var body = be32(samples.count) + be32(Int32(dataOffset))
+                var body = be32(samples.count) + be32(dataOffset)
                 for (dur, d, fl) in samples {
                     body.append(be32(dur)); body.append(be32(d.count)); body.append(be32(UInt32(fl)))
                 }
@@ -548,7 +548,7 @@ enum TS2MP4 {
             let minf = box("minf", mediaHdr + dinf + stbl)
             let mdia = box("mdia", mdhd + hdlr + minf)
 
-            var tk = be32(0) + be32(0) + be32(tid) + be32(0) + be32(0)   // times 用 0，分片里给
+            var tk = be32(0) + be32(0) + be32(tid) + be32(0) + be32(0)   // duration 用 0，分片里给
             tk.append(Data(repeating: 0, count: 8))                       // reserved
             tk.append(be16(0))                                            // layer
             tk.append(be16(0))                                            // alt group
@@ -581,9 +581,8 @@ enum TS2MP4 {
         let vEntryBox = box("avc1", vEntry)
 
         // esds
-        var asc = (audioProfile << 11) | (sampleRateIndex << 7) | (channels << 3)
+        let asc = (audioProfile << 11) | (sampleRateIndex << 7) | (channels << 3)
         let ascData = Data([UInt8((asc >> 8) & 0xFF), UInt8(asc & 0xFF)])
-        _ = asc
         let dsi = desc(0x05, ascData)
         var dcdPayload = Data([0x40, 0x15])
         dcdPayload.append(Data(repeating: 0, count: 3))          // ⚠ bufferSizeDB 是 3 字节
